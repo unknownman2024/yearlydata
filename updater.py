@@ -8,17 +8,15 @@ import pytz
 
 # ------------ CONFIG ------------
 
-START_YEAR = 2023
 TIMEOUT = 25
-SLEEP = 0.3
+SLEEP = 0.25
 
 IST = pytz.timezone("Asia/Kolkata")
 
 
-# ------------ TIME HELPERS ------------
+# ------------ TIME ------------
 
 def today_ist():
-
     return datetime.datetime.now(IST).date()
 
 
@@ -77,16 +75,22 @@ def fetch_day(date_str):
         return None
 
 
-# ------------ DB HELPERS ------------
+# ------------ YEAR SELECTION ------------
 
-def empty_year(year):
+def years_to_update():
 
-    return {
-        "year": year,
-        "last_updated": "",
-        "movies": {}
-    }
+    today = today_ist()
 
+    y = today.year
+
+    # Jan 1–2 → prev + current
+    if today.month == 1 and today.day <= 2:
+        return [y-1, y]
+
+    return [y]
+
+
+# ------------ LOAD / SAVE ------------
 
 def load_year(year):
 
@@ -97,14 +101,16 @@ def load_year(year):
         with open(fname, "r", encoding="utf-8") as f:
             return json.load(f)
 
-    return empty_year(year)
+    return {
+        "year": year,
+        "last_updated": "",
+        "movies": {}
+    }
 
 
 def save_year(db, year):
 
-    fname = f"{year}.json"
-
-    with open(fname, "w", encoding="utf-8") as f:
+    with open(f"{year}.json", "w", encoding="utf-8") as f:
 
         json.dump(
             db,
@@ -114,24 +120,15 @@ def save_year(db, year):
         )
 
 
-# ------------ AGG HELPERS ------------
+# ------------ CORE ------------
 
 def ensure_movie(db, name):
 
     if name not in db["movies"]:
 
         db["movies"][name] = {
-
             "daily": {},
-
-            "totals": {
-                "gross": 0,
-                "sold": 0,
-                "shows": 0,
-                "occSum": 0,
-                "days": 0
-            },
-
+            "totals": {},
             "cityMap": {},
             "stateMap": {},
             "chainMap": {}
@@ -181,7 +178,7 @@ def update_day(db, date_str):
 
         key = date_str.replace("-", "")
 
-        # overwrite (hourly refresh)
+        # overwrite daily
         M["daily"][key] = [
             data["gross"],
             data["sold"],
@@ -189,14 +186,14 @@ def update_day(db, date_str):
             data["occupancy"]
         ]
 
-        t = M["totals"]
 
-        # reset totals (safe way)
-        t["gross"] = 0
-        t["sold"] = 0
-        t["shows"] = 0
-        t["occSum"] = 0
-        t["days"] = 0
+        # city/state/chain
+        for x in data["details"]:
+            add_stat(M["cityMap"], x["city"], x)
+            add_stat(M["stateMap"], x["state"], x)
+
+        for x in data["Chain_details"]:
+            add_stat(M["chainMap"], x["chain"], x)
 
 
     return True
@@ -204,41 +201,31 @@ def update_day(db, date_str):
 
 # ------------ REBUILD TOTALS ------------
 
-def rebuild_year(db):
+def rebuild_totals(db):
 
     for m in db["movies"].values():
 
-        t = m["totals"]
+        gross = sold = shows = occ = days = 0
 
-        t["gross"] = 0
-        t["sold"] = 0
-        t["shows"] = 0
-        t["occSum"] = 0
-        t["days"] = 0
+        for d in m["daily"].values():
 
-        m["cityMap"] = {}
-        m["stateMap"] = {}
-        m["chainMap"] = {}
+            gross += d[0]
+            sold += d[1]
+            shows += d[2]
+            occ += d[3]
+            days += 1
 
-        for dkey, arr in m["daily"].items():
+        avg = round(occ / days, 2) if days else 0
 
-            date = f"{dkey[:4]}-{dkey[4:6]}-{dkey[6:]}"
-            day = fetch_day(date)
-
-            if not day:
-                continue
-
-            data = day["movies"].get(m)
-
-            if not data:
-                continue
+        m["totals"] = {
+            "gross": gross,
+            "sold": sold,
+            "shows": shows,
+            "avgOcc": avg
+        }
 
 
-        # (we already cached per-day, so just rebuild from daily later)
-        # simplified below
-
-
-# ------------ TOP BUILDER ------------
+# ------------ BUILD TOP ------------
 
 def build_top(map_obj):
 
@@ -246,7 +233,7 @@ def build_top(map_obj):
 
     for k, v in map_obj.items():
 
-        avg = round(v["occSum"] / v["days"], 2)
+        avg = round(v["occSum"] / v["days"], 2) if v["days"] else 0
 
         arr.append([
             k,
@@ -265,19 +252,6 @@ def finalize(db):
 
     for m in db["movies"].values():
 
-        t = m["totals"]
-
-        if t["days"]:
-
-            t["avgOcc"] = round(t["occSum"] / t["days"], 2)
-
-        else:
-            t["avgOcc"] = 0
-
-
-        del t["occSum"]
-        del t["days"]
-
         m["topCities"] = build_top(m["cityMap"])
         m["topStates"] = build_top(m["stateMap"])
         m["topChains"] = build_top(m["chainMap"])
@@ -285,23 +259,6 @@ def finalize(db):
         del m["cityMap"]
         del m["stateMap"]
         del m["chainMap"]
-
-
-# ------------ YEAR SELECTION LOGIC ------------
-
-def years_to_update():
-
-    today = today_ist()
-
-    y = today.year
-    d = today.day
-    m = today.month
-
-    # Jan 1–2 → prev + current
-    if m == 1 and d <= 2:
-        return [y-1, y]
-
-    return [y]
 
 
 # ------------ MAIN ------------
@@ -313,6 +270,7 @@ def main():
     print("Updating:", years)
 
     today = today_ist()
+
 
     for year in years:
 
@@ -336,6 +294,7 @@ def main():
 
             need = True
 
+
             # if already exists & not today → skip
             for m in db["movies"].values():
 
@@ -355,6 +314,8 @@ def main():
             d += datetime.timedelta(days=1)
 
 
+        # rebuild
+        rebuild_totals(db)
         finalize(db)
 
         save_year(db, year)
