@@ -20,6 +20,10 @@ def is_more_than_one_month_old(date_str):
     return (now - d).days > 31
 
 
+def safe_num(x):
+    return x if isinstance(x, (int, float)) else 0
+
+
 def fetch_day(date_str):
 
     date_code = date_str.replace("-", "")
@@ -116,10 +120,10 @@ def build_year(year):
 
         m = map_obj[key]
 
-        m["gross"] += data["gross"]
-        m["sold"] += data["sold"]
-        m["shows"] += data["shows"]
-        m["occSum"] += data["occupancy"]
+        m["gross"] += safe_num(data.get("gross"))
+        m["sold"] += safe_num(data.get("sold"))
+        m["shows"] += safe_num(data.get("shows"))
+        m["occSum"] += safe_num(data.get("occupancy"))
         m["days"] += 1
 
 
@@ -142,7 +146,8 @@ def build_year(year):
 
         day = fetch_day(ds)
 
-        if not day:
+        if not day or "movies" not in day:
+
             d += datetime.timedelta(days=1)
             continue
 
@@ -159,34 +164,34 @@ def build_year(year):
 
             # daily
             M["daily"][key] = [
-                data["gross"],
-                data["sold"],
-                data["shows"],
-                data["occupancy"]
+                safe_num(data.get("gross")),
+                safe_num(data.get("sold")),
+                safe_num(data.get("shows")),
+                safe_num(data.get("occupancy"))
             ]
 
 
             # totals
             t = M["totals"]
 
-            t["gross"] += data["gross"]
-            t["sold"] += data["sold"]
-            t["shows"] += data["shows"]
-            t["occSum"] += data["occupancy"]
+            t["gross"] += safe_num(data.get("gross"))
+            t["sold"] += safe_num(data.get("sold"))
+            t["shows"] += safe_num(data.get("shows"))
+            t["occSum"] += safe_num(data.get("occupancy"))
             t["days"] += 1
 
 
             # cities / states
-            for x in data["details"]:
+            for x in data.get("details", []):
 
-                add_stat(M["cityMap"], x["city"], x)
-                add_stat(M["stateMap"], x["state"], x)
+                add_stat(M["cityMap"], x.get("city","NA"), x)
+                add_stat(M["stateMap"], x.get("state","NA"), x)
 
 
             # chains
-            for x in data["Chain_details"]:
+            for x in data.get("Chain_details", []):
 
-                add_stat(M["chainMap"], x["chain"], x)
+                add_stat(M["chainMap"], x.get("chain","NA"), x)
 
 
         time.sleep(SLEEP)
@@ -202,7 +207,7 @@ def build_year(year):
 
         for k, v in map_obj.items():
 
-            avg = round(v["occSum"] / v["days"], 2)
+            avg = round(v["occSum"] / v["days"], 2) if v["days"] else 0
 
             arr.append([
                 k,
@@ -221,11 +226,7 @@ def build_year(year):
 
         t = m["totals"]
 
-        if t["days"]:
-            t["avgOcc"] = round(t["occSum"] / t["days"], 2)
-        else:
-            t["avgOcc"] = 0
-
+        t["avgOcc"] = round(t["occSum"] / t["days"], 2) if t["days"] else 0
 
         del t["occSum"]
         del t["days"]
