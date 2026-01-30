@@ -6,7 +6,7 @@ import os
 import pytz
 
 
-# ---------------- CONFIG ----------------
+# ================= CONFIG =================
 
 TIMEOUT = 25
 SLEEP = 0.3
@@ -14,7 +14,7 @@ SLEEP = 0.3
 IST = pytz.timezone("Asia/Kolkata")
 
 
-# ---------------- TIME ----------------
+# ================= TIME =================
 
 def today_ist():
     return datetime.datetime.now(IST).date()
@@ -28,7 +28,11 @@ def is_more_than_one_month_old(date_str):
     return (now - d).days > 31
 
 
-# ---------------- FETCH ----------------
+def safe_num(x):
+    return x if isinstance(x, (int, float)) else 0
+
+
+# ================= FETCH =================
 
 def fetch_day(date_str):
 
@@ -39,7 +43,7 @@ def fetch_day(date_str):
     url = ""
     fallback = ""
 
-    # 2025 & below
+    # 2025 and below
     if date_code <= "20251231":
 
         url = f"https://bfilmyapi2025.pages.dev/daily/data/{year}/{md}_finalsummary.json"
@@ -80,7 +84,7 @@ def fetch_day(date_str):
         return None
 
 
-# ---------------- YEAR LOGIC ----------------
+# ================= YEAR LOGIC =================
 
 def years_to_update():
 
@@ -94,7 +98,7 @@ def years_to_update():
     return [y]
 
 
-# ---------------- LOAD / SAVE ----------------
+# ================= LOAD / SAVE =================
 
 def empty_year(year):
 
@@ -133,7 +137,7 @@ def save_year(db, year):
         )
 
 
-# ---------------- MOVIE INIT / REPAIR ----------------
+# ================= MOVIE INIT / REPAIR =================
 
 def ensure_movie(db, name):
 
@@ -170,7 +174,7 @@ def ensure_movie(db, name):
     return db["movies"][name]
 
 
-# ---------------- AGG HELPERS ----------------
+# ================= AGG HELPERS =================
 
 def add_stat(map_obj, key, data):
 
@@ -186,14 +190,14 @@ def add_stat(map_obj, key, data):
 
     m = map_obj[key]
 
-    m["gross"] += data.get("gross", 0)
-    m["sold"] += data.get("sold", 0)
-    m["shows"] += data.get("shows", 0)
-    m["occSum"] += data.get("occupancy", 0)
+    m["gross"] += safe_num(data.get("gross"))
+    m["sold"] += safe_num(data.get("sold"))
+    m["shows"] += safe_num(data.get("shows"))
+    m["occSum"] += safe_num(data.get("occupancy"))
     m["days"] += 1
 
 
-# ---------------- UPDATE DAY ----------------
+# ================= UPDATE DAY =================
 
 def update_day(db, date_str):
 
@@ -213,32 +217,32 @@ def update_day(db, date_str):
 
         key = date_str.replace("-", "")
 
-        # overwrite daily (hourly refresh)
+        # overwrite daily
         M["daily"][key] = [
-            data.get("gross", 0),
-            data.get("sold", 0),
-            data.get("shows", 0),
-            data.get("occupancy", 0)
+            safe_num(data.get("gross")),
+            safe_num(data.get("sold")),
+            safe_num(data.get("shows")),
+            safe_num(data.get("occupancy"))
         ]
 
 
         # cities / states
         for x in data.get("details", []):
 
-            add_stat(M["cityMap"], x.get("city","NA"), x)
-            add_stat(M["stateMap"], x.get("state","NA"), x)
+            add_stat(M["cityMap"], x.get("city", "NA"), x)
+            add_stat(M["stateMap"], x.get("state", "NA"), x)
 
 
         # chains
         for x in data.get("Chain_details", []):
 
-            add_stat(M["chainMap"], x.get("chain","NA"), x)
+            add_stat(M["chainMap"], x.get("chain", "NA"), x)
 
 
     return True
 
 
-# ---------------- REBUILD TOTALS ----------------
+# ================= REBUILD TOTALS =================
 
 def rebuild_totals(db):
 
@@ -265,7 +269,7 @@ def rebuild_totals(db):
         }
 
 
-# ---------------- BUILD TOP ----------------
+# ================= BUILD TOP =================
 
 def build_top(map_obj):
 
@@ -292,9 +296,21 @@ def finalize(db):
 
     for m in db["movies"].values():
 
+        # repair safety (for old files)
+        if "cityMap" not in m:
+            m["cityMap"] = {}
+
+        if "stateMap" not in m:
+            m["stateMap"] = {}
+
+        if "chainMap" not in m:
+            m["chainMap"] = {}
+
+
         m["topCities"] = build_top(m["cityMap"])
         m["topStates"] = build_top(m["stateMap"])
         m["topChains"] = build_top(m["chainMap"])
+
 
         # cleanup
         del m["cityMap"]
@@ -302,7 +318,7 @@ def finalize(db):
         del m["chainMap"]
 
 
-# ---------------- MAIN ----------------
+# ================= MAIN =================
 
 def main():
 
@@ -316,6 +332,11 @@ def main():
     for year in years:
 
         db = load_year(year)
+
+        # repair old movies immediately
+        for name in list(db["movies"].keys()):
+            ensure_movie(db, name)
+
 
         start = datetime.date(year, 1, 1)
 
