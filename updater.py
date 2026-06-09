@@ -1,134 +1,267 @@
-import requests
+import asyncio
+import aiohttp
 import json
 import datetime
-import time
 import os
 import pytz
+import re
 
-
-# ================= CONFIG =================
+PREFERRED_CHAINS = [
+    "PVR",
+    "INOX",
+    "Cinepolis"
+]
+OUTPUT_DIR = "moviedata"
+os.makedirs(
+    OUTPUT_DIR,
+    exist_ok=True
+)
+MIN_MOVIE_DAY_GROSS = 500000
 
 TIMEOUT = 25
-SLEEP = 0.3
+CONCURRENCY = 100
 
 IST = pytz.timezone("Asia/Kolkata")
 
+NORTH = {
+    "Maharashtra","NCR","Delhi","Gujarat","Uttar Pradesh","West Bengal",
+    "Rajasthan","Punjab","Madhya Pradesh","Chhattisgarh","Odisha","Haryana",
+    "Bihar","Uttarakhand","Goa","Assam","Jharkhand","Jammu and Kashmir",
+    "Andaman And Nicobar Islands","Meghalaya","Himachal Pradesh","Chandigarh",
+    "Tripura","Arunachal Pradesh","Sikkim","Manipur","Mizoram","Nagaland"
+}
 
-# ================= TIME =================
+SOUTH = {
+    "Tamil Nadu","Karnataka","Kerala",
+    "Telangana","Andhra Pradesh","Puducherry"
+}
+
+def normalize_movie_name(name):
+    return re.sub(r"\s*\[.*?\]\s*$", "", name).strip()
+
+def save_database(years):
+
+    movie_dates = {}
+
+    for year in years:
+
+        fn = os.path.join(
+            OUTPUT_DIR,
+            f"{year}.json"
+        )
+
+        if not os.path.exists(fn):
+            continue
+
+        with open(fn, "r", encoding="utf8") as f:
+            db = json.load(f)
+
+        for movie_name, movie in db.get("movies", {}).items():
+
+            base_name = normalize_movie_name(movie_name)
+
+            dates = movie_dates.setdefault(base_name, [])
+
+            for d in movie.get("daily", {}):
+
+                dates.append(
+                    datetime.datetime.strptime(
+                        d,
+                        "%Y%m%d"
+                    ).date()
+                )
+
+    movies = []
+
+    for name, dates in movie_dates.items():
+
+        if not dates:
+            continue
+
+        dates = sorted(set(dates))
+
+        runs = []
+
+        start = dates[0]
+        prev = dates[0]
+
+        for d in dates[1:]:
+
+            if (d - prev).days > 5:
+                runs.append((start, prev))
+                start = d
+
+            prev = d
+
+        runs.append((start, prev))
+
+        best_start = None
+        best_end = None
+        best_length = -1
+
+        for start, end in runs:
+
+            length = (end - start).days + 1
+
+            if length > best_length:
+                best_length = length
+                best_start = start
+                best_end = end
+
+
+        movies.append([
+            name,
+            int(best_start.strftime("%Y%m%d")),
+            int(best_end.strftime("%Y%m%d"))
+        ])
+
+    movies.sort(
+        key=lambda x: x[2],
+        reverse=True
+    )
+
+    data = {
+        "u": int(datetime.datetime.now(IST).strftime("%Y%m%d")),
+        "m": movies
+    }
+
+    with open(
+        os.path.join(
+            OUTPUT_DIR,
+            "database.json.tmp"
+        ),
+        "w",
+        encoding="utf8"
+    ) as f:
+
+        json.dump(
+            data,
+            f,
+            ensure_ascii=False,
+            separators=(",", ":")
+        )
+
+        f.flush()
+        os.fsync(f.fileno())
+
+    os.replace(
+        os.path.join(
+            OUTPUT_DIR,
+            "database.json.tmp"
+        ),
+        os.path.join(
+            OUTPUT_DIR,
+            "database.json"
+        )
+    )
+
+    print(
+        f"database.json saved ({len(movies)} movies)"
+    )
 
 def today_ist():
     return datetime.datetime.now(IST).date()
 
 
+def safe_num(v):
+    return v if isinstance(v, (int, float)) else 0
+
+
 def is_more_than_one_month_old(date_str):
-
     d = datetime.datetime.strptime(date_str, "%Y-%m-%d")
-    now = datetime.datetime.utcnow()
-
-    return (now - d).days > 31
+    return (datetime.datetime.utcnow() - d).days > 31
 
 
-def safe_num(x):
-    return x if isinstance(x, (int, float)) else 0
-
-
-# ================= FETCH =================
-
-def fetch_day(date_str):
-
+def get_urls(date_str):
     date_code = date_str.replace("-", "")
     year = int(date_str[:4])
     md = date_str[5:]
 
-    url = ""
-    fallback = ""
-
-    # 2025 and below
     if date_code <= "20251231":
-
         url = f"https://bfilmyapi2025.pages.dev/daily/data/{year}/{md}_finalsummary.json"
         fallback = url
 
-    # 2026+ archive
     elif year >= 2026 and is_more_than_one_month_old(date_str):
-
         url = f"https://bfilmyapi{year}.pages.dev/daily/data/{year}/{md}_finalsummary.json"
         fallback = url
 
-    # latest
     else:
-
         url = f"https://bfilmyapi.pages.dev/daily/data/{date_code}/finalsummary.json"
-
         fallback = f"https://bfilmyapi{year}.pages.dev/daily/data/{year}/{md}_finalsummary.json"
 
+    return url, fallback
 
-    params = {"_": int(time.time() * 1000)}
 
+async def fetch_json(session, url):
     try:
-
-        r = requests.get(url, params=params, timeout=TIMEOUT)
-
-        if r.status_code != 200 and fallback:
-
-            r = requests.get(fallback, params=params, timeout=TIMEOUT)
-
-        if r.status_code != 200:
-            return None
-
-        return r.json()
-
-    except Exception as e:
-
-        print("Fetch error:", date_str, e)
-        return None
+        async with session.get(url) as r:
+            if r.status == 200:
+                return await r.json()
+    except:
+        pass
+    return None
 
 
-# ================= YEAR LOGIC =================
+async def fetch_day(session, date_str):
+    url, fallback = get_urls(date_str)
 
-def years_to_update():
+    data = await fetch_json(session, url)
 
-    today = today_ist()
-    y = today.year
+    if data:
+        return date_str, data
 
-    # Jan 1–2 grace
-    if today.month == 1 and today.day <= 2:
-        return [y - 1, y]
+    if fallback != url:
+        data = await fetch_json(session, fallback)
 
-    return [y]
+    return date_str, data
 
 
-# ================= LOAD / SAVE =================
-
-def empty_year(year):
-
+def empty_db(year):
     return {
         "year": year,
         "last_updated": "",
+        "_meta": {"lastProcessedDate": None},
         "movies": {}
     }
 
 
 def load_year(year):
+    fn = os.path.join(
+        OUTPUT_DIR,
+        f"{year}.json"
+    )
 
-    fname = f"{year}.json"
+    if not os.path.exists(fn):
+        return empty_db(year)
 
-    if os.path.exists(fname):
+    with open(fn, "r", encoding="utf8") as f:
+        db = json.load(f)
 
-        try:
-            with open(fname, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except:
-            print("Corrupt file, rebuilding:", fname)
-            return empty_year(year)
+    db.setdefault("_meta", {"lastProcessedDate": None})
 
-    return empty_year(year)
+    for m in db.get("movies", {}).values():
+        m.setdefault("daily", {})
+        m.setdefault("totals", {})
+        m.setdefault("cities", {})
+        m.setdefault("states", {})
+        m.setdefault("chains", {})
+
+    return db
 
 
-def save_year(db, year):
+def atomic_save(year, db):
+    final_file = os.path.join(
+        OUTPUT_DIR,
+        f"{year}.json"
+    )
 
-    with open(f"{year}.json", "w", encoding="utf-8") as f:
 
+    tmp_file = os.path.join(
+        OUTPUT_DIR,
+        f"{year}.json.tmp"
+    )
+
+    with open(tmp_file, "w", encoding="utf8") as f:
         json.dump(
             db,
             f,
@@ -136,256 +269,444 @@ def save_year(db, year):
             separators=(",", ":")
         )
 
+        f.flush()
+        os.fsync(f.fileno())
 
-# ================= MOVIE INIT / REPAIR =================
+    os.replace(tmp_file, final_file)
+
 
 def ensure_movie(db, name):
 
-    if name not in db["movies"]:
+    movies = db["movies"]
 
-        db["movies"][name] = {
+    if name not in movies:
+        movies[name] = {
             "daily": {},
             "totals": {},
-            "cityMap": {},
-            "stateMap": {},
-            "chainMap": {}
+            "cities": {},
+            "states": {},
+            "chains": {},
+            "topCities": [],
+            "topStates": [],
+            "topChains": []
         }
 
-    else:
-
-        m = db["movies"][name]
-
-        # auto repair
-        if "daily" not in m:
-            m["daily"] = {}
-
-        if "totals" not in m:
-            m["totals"] = {}
-
-        if "cityMap" not in m:
-            m["cityMap"] = {}
-
-        if "stateMap" not in m:
-            m["stateMap"] = {}
-
-        if "chainMap" not in m:
-            m["chainMap"] = {}
-
-    return db["movies"][name]
+    return movies[name]
 
 
-# ================= AGG HELPERS =================
+def add_stat(container, key, row):
+    if not key:
+        return
 
-def add_stat(map_obj, key, data):
+    x = container.setdefault(key, {
+        "gross": 0,
+        "sold": 0,
+        "shows": 0,
+        "occSum": 0.0,
+        "days": 0
+    })
 
-    if key not in map_obj:
+    x["gross"] += int(safe_num(row.get("gross")))
+    x["sold"] += int(safe_num(row.get("sold")))
+    x["shows"] += int(safe_num(row.get("shows")))
 
-        map_obj[key] = {
-            "gross": 0,
-            "sold": 0,
-            "shows": 0,
-            "occSum": 0,
-            "days": 0
-        }
+    x["occSum"] = round(
+        x["occSum"] + safe_num(row.get("occupancy")),
+        2
+    )
 
-    m = map_obj[key]
-
-    m["gross"] += safe_num(data.get("gross"))
-    m["sold"] += safe_num(data.get("sold"))
-    m["shows"] += safe_num(data.get("shows"))
-    m["occSum"] += safe_num(data.get("occupancy"))
-    m["days"] += 1
-
-
-# ================= UPDATE DAY =================
-
-def update_day(db, date_str):
-
-    day = fetch_day(date_str)
-
-    if not day or "movies" not in day:
-        return False
+    x["days"] += 1
 
 
-    if "last_updated" in day:
-        db["last_updated"] = day["last_updated"]
-
-
-    for name, data in day["movies"].items():
-
-        M = ensure_movie(db, name)
-
-        key = date_str.replace("-", "")
-
-        # overwrite daily
-        M["daily"][key] = [
-            safe_num(data.get("gross")),
-            safe_num(data.get("sold")),
-            safe_num(data.get("shows")),
-            safe_num(data.get("occupancy"))
-        ]
-
-
-        # cities / states
-        for x in data.get("details", []):
-
-            add_stat(M["cityMap"], x.get("city", "NA"), x)
-            add_stat(M["stateMap"], x.get("state", "NA"), x)
-
-
-        # chains
-        for x in data.get("Chain_details", []):
-
-            add_stat(M["chainMap"], x.get("chain", "NA"), x)
-
-
-    return True
-
-
-# ================= REBUILD TOTALS =================
-
-def rebuild_totals(db):
-
-    for m in db["movies"].values():
-
-        gross = sold = shows = occ = days = 0
-
-        for d in m["daily"].values():
-
-            gross += d[0]
-            sold += d[1]
-            shows += d[2]
-            occ += d[3]
-            days += 1
-
-
-        avg = round(occ / days, 2) if days else 0
-
-        m["totals"] = {
-            "gross": gross,
-            "sold": sold,
-            "shows": shows,
-            "avgOcc": avg
-        }
-
-
-# ================= BUILD TOP =================
-
-def build_top(map_obj):
+def build_top(container, limit=5):
 
     arr = []
 
-    for k, v in map_obj.items():
+    for k, v in container.items():
 
-        avg = round(v["occSum"] / v["days"], 2) if v["days"] else 0
+        avg = round(
+            v["occSum"] / v["days"],
+            2
+        ) if v["days"] else 0
 
         arr.append([
             k,
-            v["gross"],
-            v["sold"],
-            v["shows"],
+            int(v["gross"]),
+            int(v["sold"]),
+            int(v["shows"]),
             avg
         ])
 
-    arr.sort(key=lambda x: x[1], reverse=True)
+    arr.sort(
+        key=lambda x: x[1],
+        reverse=True
+    )
 
-    return arr[:5]
+    return arr[:limit]
+
+
+def build_top_states(state_map):
+
+    ranked = sorted(
+        state_map.items(),
+        key=lambda x: x[1]["gross"],
+        reverse=True
+    )
+
+    top5 = ranked[:5]
+
+    rs = {
+        "gross": 0,
+        "sold": 0,
+        "shows": 0,
+        "occSum": 0,
+        "days": 0
+    }
+
+    rn = {
+        "gross": 0,
+        "sold": 0,
+        "shows": 0,
+        "occSum": 0,
+        "days": 0
+    }
+
+    result = []
+
+    for state, stats in top5:
+
+        avg = round(
+            stats["occSum"] / stats["days"],
+            2
+        ) if stats["days"] else 0
+
+        result.append([
+            state,
+            int(stats["gross"]),
+            int(stats["sold"]),
+            int(stats["shows"]),
+            avg
+        ])
+
+    for state, stats in ranked[5:]:
+
+        target = rs if state in SOUTH else rn
+
+        target["gross"] += stats["gross"]
+        target["sold"] += stats["sold"]
+        target["shows"] += stats["shows"]
+        target["occSum"] += stats["occSum"]
+        target["days"] += stats["days"]
+
+    if rs["gross"]:
+
+        result.append([
+            "RS",
+            int(rs["gross"]),
+            int(rs["sold"]),
+            int(rs["shows"]),
+            round(rs["occSum"] / rs["days"], 2)
+            if rs["days"] else 0
+        ])
+
+    if rn["gross"]:
+
+        result.append([
+            "RN",
+            int(rn["gross"]),
+            int(rn["sold"]),
+            int(rn["shows"]),
+            round(rn["occSum"] / rn["days"], 2)
+            if rn["days"] else 0
+        ])
+
+    return result
+
+def rebuild_totals(movie):
+    gross = sold = shows = 0
+    occ = days = 0
+
+    for d in movie["daily"].values():
+        gross += d[0]
+        sold += d[1]
+        shows += d[2]
+        occ += d[3]
+        days += 1
+
+    movie["totals"] = {
+        "gross": int(gross),
+        "sold": int(sold),
+        "shows": int(shows),
+        "avgOcc": round(occ / days, 2) if days else 0
+    }
+
+def build_top_chains(chain_map):
+
+    result = []
+
+    used = set()
+
+    for chain in PREFERRED_CHAINS:
+
+        if chain not in chain_map:
+            continue
+
+        stats = chain_map[chain]
+
+        avg = round(
+            stats["occSum"] / stats["days"],
+            2
+        ) if stats["days"] else 0
+
+        result.append([
+            chain,
+            int(stats["gross"]),
+            int(stats["sold"]),
+            int(stats["shows"]),
+            avg
+        ])
+
+        used.add(chain)
+
+    remaining = []
+
+    for chain, stats in chain_map.items():
+
+        if chain in used:
+            continue
+
+        avg = round(
+            stats["occSum"] / stats["days"],
+            2
+        ) if stats["days"] else 0
+
+        remaining.append([
+            chain,
+            int(stats["gross"]),
+            int(stats["sold"]),
+            int(stats["shows"]),
+            avg
+        ])
+
+    remaining.sort(
+        key=lambda x: x[1],
+        reverse=True
+    )
+
+    result.extend(
+        remaining[:max(0, 5 - len(result))]
+    )
+
+    return result
+
+def process_day(db, date_str, payload):
+    if not payload or "movies" not in payload:
+        return
+
+    db["last_updated"] = payload.get("last_updated", "")
+
+    date_key = date_str.replace("-", "")
+
+    base_gross = {}
+
+    for movie_name, data in payload["movies"].items():
+
+        base_name = normalize_movie_name(movie_name)
+
+        base_gross[base_name] = (
+            base_gross.get(base_name, 0)
+            + safe_num(data.get("gross"))
+        )
+
+    for movie_name, data in payload["movies"].items():
+
+        base_name = normalize_movie_name(movie_name)
+
+        if base_gross[base_name] < MIN_MOVIE_DAY_GROSS:
+            continue
+
+        movie = ensure_movie(db, movie_name)
+
+        movie["daily"][date_key] = [
+            int(safe_num(data.get("gross"))),
+            int(safe_num(data.get("sold"))),
+            int(safe_num(data.get("shows"))),
+            round(safe_num(data.get("occupancy")), 2)
+        ]
+
+        for row in (data.get("details") or []):
+            city = row.get("city")
+            state = row.get("state")
+
+            if city:
+                add_stat(movie["cities"], city, row)
+
+            if state:
+                add_stat(movie["states"], state, row)
+
+        for row in (data.get("Chain_details") or []):
+            chain = row.get("chain")
+
+            if chain:
+                add_stat(movie["chains"], chain, row)
 
 
 def finalize(db):
 
-    for m in db["movies"].values():
+    for movie in db["movies"].values():
 
-        # repair safety (for old files)
-        if "cityMap" not in m:
-            m["cityMap"] = {}
+        rebuild_totals(movie)
 
-        if "stateMap" not in m:
-            m["stateMap"] = {}
+        movie["topCities"] = build_top(
+            movie["cities"],
+            5
+        )
 
-        if "chainMap" not in m:
-            m["chainMap"] = {}
+        movie["topStates"] = build_top_states(
+            movie["states"]
+        )
 
+        movie["topChains"] = build_top_chains(
+            movie["chains"]
+        )
 
-        m["topCities"] = build_top(m["cityMap"])
-        m["topStates"] = build_top(m["stateMap"])
-        m["topChains"] = build_top(m["chainMap"])
-
-
-        # cleanup
-        del m["cityMap"]
-        del m["stateMap"]
-        del m["chainMap"]
+        movie.pop("cities", None)
+        movie.pop("states", None)
+        movie.pop("chains", None)
 
 
-# ================= MAIN =================
+async def update_year(session, year):
+    db = load_year(year)
 
-def main():
-
-    years = years_to_update()
-
-    print("Updating:", years)
-
+    meta = db["_meta"]
     today = today_ist()
 
+    # Rebuild current year from scratch every run
+    if year == today.year:
 
-    for year in years:
+        db["movies"] = {}
+        meta["lastProcessedDate"] = None
 
-        db = load_year(year)
+    # Current year: rebuild from Jan 1 every run
+    if year == today.year:
 
-        # repair old movies immediately
-        for name in list(db["movies"].keys()):
-            ensure_movie(db, name)
+        db["movies"] = {}
+        meta["lastProcessedDate"] = None
 
+        start = datetime.date(
+            year,
+            1,
+            1
+        )
 
-        start = datetime.date(year, 1, 1)
+    else:
 
-        if year == today.year:
-            end = today
+        if meta["lastProcessedDate"]:
+            start = (
+                datetime.datetime.strptime(
+                    meta["lastProcessedDate"],
+                    "%Y-%m-%d"
+                ).date()
+                + datetime.timedelta(days=1)
+            )
         else:
-            end = datetime.date(year, 12, 31)
+            start = datetime.date(
+                year,
+                1,
+                1
+            )
 
+    end = (
+        today
+        if year == today.year
+        else datetime.date(year, 12, 31)
+    )
 
-        d = start
+    dates = []
 
-        while d <= end:
+    d = start
 
-            ds = d.strftime("%Y-%m-%d")
+    while d <= end:
+        dates.append(
+            d.strftime("%Y-%m-%d")
+        )
+        d += datetime.timedelta(days=1)
 
-            key = ds.replace("-", "")
+    if not dates:
+        print(f"{year}: already up to date")
+        return
 
-            need = True
+    print(
+        f"{year}: fetching {len(dates)} days"
+    )
 
+    sem = asyncio.Semaphore(
+        CONCURRENCY
+    )
 
-            # skip old existing days
-            for m in db["movies"].values():
+    async def worker(ds):
+        async with sem:
+            return await fetch_day(
+                session,
+                ds
+            )
 
-                if key in m["daily"] and d != today:
-                    need = False
-                    break
+    results = await asyncio.gather(
+        *(worker(ds) for ds in dates),
+        return_exceptions=True
+    )
 
+    for result in results:
 
-            if need:
+        if isinstance(result, Exception):
+            continue
 
-                print("Fetch", ds)
+        date_str, payload = result
 
-                update_day(db, ds)
+        if payload:
+            process_day(
+                db,
+                date_str,
+                payload
+            )
 
-                time.sleep(SLEEP)
+    meta["lastProcessedDate"] = (
+        end.strftime("%Y-%m-%d")
+    )
 
+    finalize(db)
 
-            d += datetime.timedelta(days=1)
+    atomic_save(
+        year,
+        db
+    )
 
+    print(f"{year}: saved")
 
-        # rebuild & finalize
-        rebuild_totals(db)
-        finalize(db)
+async def main():
 
-        save_year(db, year)
+    timeout = aiohttp.ClientTimeout(total=TIMEOUT)
 
-        print("Saved", year)
+    connector = aiohttp.TCPConnector(
+        limit=CONCURRENCY,
+        ttl_dns_cache=300,
+        enable_cleanup_closed=True
+    )
 
+    async with aiohttp.ClientSession(
+        timeout=timeout,
+        connector=connector
+    ) as session:
+
+        current_year = today_ist().year
+
+        years = list(range(2023, current_year + 1))
+
+        await asyncio.gather(
+            *(update_year(session, year) for year in years)
+        )
+        save_database(years)
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
