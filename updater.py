@@ -166,11 +166,16 @@ def today_ist():
 def safe_num(v):
     return v if isinstance(v, (int, float)) else 0
 
-
 def is_more_than_one_month_old(date_str):
-    d = datetime.datetime.strptime(date_str, "%Y-%m-%d")
-    return (datetime.datetime.utcnow() - d).days > 31
 
+    d = datetime.datetime.strptime(
+        date_str,
+        "%Y-%m-%d"
+    ).date()
+
+    return (
+        datetime.datetime.now(IST).date() - d
+    ).days > 31
 
 def get_urls(date_str):
     date_code = date_str.replace("-", "")
