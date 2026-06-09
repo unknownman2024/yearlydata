@@ -1,34 +1,54 @@
-name: Hourly DB Update
+name: Update Movie Data
 
 on:
-  schedule:
-    - cron: "0 * * * *"   # every hour
   workflow_dispatch:
 
-jobs:
-  build:
+  schedule:
+    # Every 2 hours
+    - cron: '0 */2 * * *'
 
+permissions:
+  contents: write
+
+concurrency:
+  group: yearlydata-updater
+  cancel-in-progress: false
+
+jobs:
+  update:
     runs-on: ubuntu-latest
 
+    timeout-minutes: 120
+
     steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
 
-    - uses: actions/checkout@v4
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
 
-    - uses: actions/setup-python@v5
-      with:
-        python-version: "3.11"
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install aiohttp pytz
 
-    - name: Install
-      run: pip install -r requirements.txt
+      - name: Run Updater
+        run: |
+          python updater.py
 
-    - name: Update
-      run: python updater.py
+      - name: Commit Changes
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-    - name: Commit
-      run: |
-        git config user.name "github-actions"
-        git config user.email "actions@github.com"
+          git add moviedata/
 
-        git add *.json
-        git commit -m "Hourly update" || echo "No changes"
-        git push
+          if git diff --cached --quiet; then
+            echo "No changes"
+            exit 0
+          fi
+
+          git commit -m "Auto update movie data"
+          git push
