@@ -39,6 +39,7 @@ SOUTH = {
 def normalize_movie_name(name):
     return re.sub(r"\s*\[.*?\]\s*$", "", name).strip()
 
+
 def save_database(years):
 
     movie_dates = {}
@@ -226,6 +227,7 @@ def empty_db(year):
         "year": year,
         "last_updated": "",
         "_meta": {"lastProcessedDate": None},
+        "movieSummary": {},
         "movies": {}
     }
 
@@ -243,6 +245,7 @@ def load_year(year):
         db = json.load(f)
 
     db.setdefault("_meta", {"lastProcessedDate": None})
+    db.setdefault("movieSummary", {})
 
     for m in db.get("movies", {}).values():
         m.setdefault("daily", {})
@@ -445,7 +448,10 @@ def rebuild_totals(movie):
         "avgOcc": round(occ / days, 2) if days else 0
     }
 
-def build_top_chains(chain_map):
+def build_top_chains(
+    chain_map,
+    limit=5
+):
 
     result = []
 
@@ -498,8 +504,14 @@ def build_top_chains(chain_map):
         reverse=True
     )
 
+    
     result.extend(
-        remaining[:max(0, 5 - len(result))]
+        remaining[
+            :max(
+                0,
+                limit - len(result)
+            )
+        ]
     )
 
     return result
@@ -558,7 +570,9 @@ def process_day(db, date_str, payload):
 
 def finalize(db):
 
-    for movie in db["movies"].values():
+    movie_summary = {}
+
+    for movie_name, movie in db["movies"].items():
 
         rebuild_totals(movie)
 
@@ -575,10 +589,104 @@ def finalize(db):
             movie["chains"]
         )
 
+        base_name = normalize_movie_name(
+            movie_name
+        )
+
+        summary = movie_summary.setdefault(
+            base_name,
+            {
+                "cities": {},
+                "states": {},
+                "chains": {}
+            }
+        )
+
+        for k,v in movie["cities"].items():
+
+            x = summary["cities"].setdefault(
+                k,
+                {
+                    "gross":0,
+                    "sold":0,
+                    "shows":0,
+                    "occSum":0,
+                    "days":0
+                }
+            )
+
+            x["gross"] += v["gross"]
+            x["sold"] += v["sold"]
+            x["shows"] += v["shows"]
+            x["occSum"] += v["occSum"]
+            x["days"] += v["days"]
+
+        for k,v in movie["states"].items():
+
+            x = summary["states"].setdefault(
+                k,
+                {
+                    "gross":0,
+                    "sold":0,
+                    "shows":0,
+                    "occSum":0,
+                    "days":0
+                }
+            )
+
+            x["gross"] += v["gross"]
+            x["sold"] += v["sold"]
+            x["shows"] += v["shows"]
+            x["occSum"] += v["occSum"]
+            x["days"] += v["days"]
+
+        for k,v in movie["chains"].items():
+
+            x = summary["chains"].setdefault(
+                k,
+                {
+                    "gross":0,
+                    "sold":0,
+                    "shows":0,
+                    "occSum":0,
+                    "days":0
+                }
+            )
+
+            x["gross"] += v["gross"]
+            x["sold"] += v["sold"]
+            x["shows"] += v["shows"]
+            x["occSum"] += v["occSum"]
+            x["days"] += v["days"]
+
         movie.pop("cities", None)
         movie.pop("states", None)
         movie.pop("chains", None)
 
+    db["movieSummary"] = {}
+
+    for movie_name, summary in movie_summary.items():
+
+        db["movieSummary"][movie_name] = {
+
+            "topCities":
+                build_top(
+                    summary["cities"],
+                    10
+                ),
+
+            "topStates":
+                build_top_states(
+                    summary["states"]
+                ),
+
+            "topChains":
+                build_top_chains(
+                    summary["chains"],
+                    10
+                )
+
+        }
 
 async def update_year(session, year):
     db = load_year(year)
@@ -590,12 +698,14 @@ async def update_year(session, year):
     if year == today.year:
 
         db["movies"] = {}
+        db["movieSummary"] = {}
         meta["lastProcessedDate"] = None
 
     # Current year: rebuild from Jan 1 every run
     if year == today.year:
 
         db["movies"] = {}
+        db["movieSummary"] = {}
         meta["lastProcessedDate"] = None
 
         start = datetime.date(
