@@ -361,7 +361,7 @@ def build_top_states(state_map):
         reverse=True
     )
 
-    top5 = ranked[:5]
+    top8 = ranked[:8]
 
     rs = {
         "gross": 0,
@@ -381,7 +381,7 @@ def build_top_states(state_map):
 
     result = []
 
-    for state, stats in top5:
+    for state, stats in top8:
 
         avg = round(
             stats["occSum"] / stats["days"],
@@ -396,7 +396,7 @@ def build_top_states(state_map):
             avg
         ])
 
-    for state, stats in ranked[5:]:
+    for state, stats in ranked[8:]:
 
         target = rs if state in SOUTH else rn
 
