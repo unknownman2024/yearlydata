@@ -16,7 +16,7 @@ os.makedirs(
     OUTPUT_DIR,
     exist_ok=True
 )
-MIN_MOVIE_DAY_GROSS = 500000
+MIN_MOVIE_DAY_GROSS = 50000
 
 TIMEOUT = 25
 CONCURRENCY = 100
