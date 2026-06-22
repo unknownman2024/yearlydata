@@ -24,8 +24,6 @@ DEFAULT_RETRY_BACKOFF = 0.75
 DEFAULT_MIN_MOVIE_DAY_GROSS = 100000
 REBUILD_CURRENT_YEAR_BY_DEFAULT = True
 
-PREFERRED_CHAINS = ["PVR", "INOX", "Cinepolis"]
-
 
 # ----------------------------
 # Time / text helpers
@@ -80,7 +78,7 @@ def atomic_write_json(path: str, payload: Dict[str, Any]) -> None:
     os.replace(tmp, path)
 
 
-def clear_year_dir(year_dir: str) -> None:
+def clear_dir_json(year_dir: str) -> None:
     if not os.path.isdir(year_dir):
         return
     for fn in os.listdir(year_dir):
@@ -116,16 +114,44 @@ def get_urls(date_str: str):
     if date_code <= "20251231":
         url = f"https://bfilmyapi2025.pages.dev/daily/data/{year}/{md}_finalsummary.json"
         fallback = url
-
     elif year >= 2026 and is_more_than_one_month_old(date_str):
         url = f"https://bfilmyapi{year}.pages.dev/daily/data/{year}/{md}_finalsummary.json"
         fallback = url
-
     else:
         url = f"https://bfilmyapi.pages.dev/daily/data/{date_code}/finalsummary.json"
         fallback = f"https://bfilmyapi{year}.pages.dev/daily/data/{year}/{md}_finalsummary.json"
 
     return url, fallback
+
+
+# ----------------------------
+# Row normalization
+# ----------------------------
+def normalize_source_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Convert source row keys to short keys used internally:
+    gross -> g
+    sold -> s
+    shows -> sh
+    totalSeats -> ts
+    fastfilling -> ff
+    housefull -> hf
+    occupancy -> o
+    """
+    if not isinstance(row, dict):
+        return {
+            "g": 0, "s": 0, "sh": 0, "ts": 0, "ff": 0, "hf": 0, "o": 0.0
+        }
+
+    return {
+        "g": safe_int(row.get("g", row.get("gross"))),
+        "s": safe_int(row.get("s", row.get("sold"))),
+        "sh": safe_int(row.get("sh", row.get("shows"))),
+        "ts": safe_int(row.get("ts", row.get("totalSeats"))),
+        "ff": safe_int(row.get("ff", row.get("fastfilling"))),
+        "hf": safe_int(row.get("hf", row.get("housefull"))),
+        "o": safe_float(row.get("o", row.get("occupancy"))),
+    }
 
 
 # ----------------------------
@@ -145,13 +171,15 @@ def empty_rollup() -> Dict[str, Any]:
 
 
 def add_rollup(bucket: Dict[str, Any], row: Dict[str, Any]) -> None:
-    g = safe_int(row.get("g"))
-    s = safe_int(row.get("s"))
-    sh = safe_int(row.get("sh"))
-    ts = safe_int(row.get("ts"))
-    ff = safe_int(row.get("ff"))
-    hf = safe_int(row.get("hf"))
-    o = safe_float(row.get("o"))
+    row = normalize_source_row(row)
+
+    g = row["g"]
+    s = row["s"]
+    sh = row["sh"]
+    ts = row["ts"]
+    ff = row["ff"]
+    hf = row["hf"]
+    o = row["o"]
 
     bucket["g"] += g
     bucket["s"] += s
@@ -372,7 +400,6 @@ def normalize_year_movie_entry(movie: Any) -> Dict[str, Any]:
         }
         return movie
 
-    # Final file reload support
     totals = normalize_totals_entry(movie.get("t") or movie.get("totals") or movie.get("_t"))
     states_src = movie.get("states") or {}
     states: Dict[str, Any] = {}
@@ -496,6 +523,7 @@ def add_state_day(
         state_db["u"] = payload_last_updated
 
     for row in rows:
+        row = normalize_source_row(row)
         add_rollup(day, row)
         add_rollup(movie["_t"], row)
 
@@ -514,6 +542,7 @@ def add_year_state_day(
     for state_name, rows in rows_by_state.items():
         state_bucket = movie["_states"].setdefault(state_name, empty_rollup())
         for row in rows:
+            row = normalize_source_row(row)
             add_rollup(state_bucket, row)
             add_rollup(movie["t"], row)
 
@@ -565,7 +594,7 @@ def process_day_into_states_and_year(
                 payload_last_updated=payload_last_updated,
             )
 
-        # Year summary file: movie-wise state totals only, no daywise breakdown.
+        # Year summary: movie-wise state totals only.
         add_year_state_day(
             year_db=year_db,
             movie_name=base_name,
@@ -725,6 +754,33 @@ def save_year_db(output_root: str, year: int, year_db: Dict[str, Any]) -> str:
     return path
 
 
+def get_year_start_for_update(
+    year: int,
+    state_dbs: Dict[str, Dict[str, Any]],
+    rebuild_current_year: bool,
+) -> dt.date:
+    if year == today_ist().year and rebuild_current_year:
+        return dt.date(year, 1, 1)
+
+    last_dates = []
+    for db in state_dbs.values():
+        lpd = db.get("_m", {}).get("lpd")
+        if lpd:
+            try:
+                last_dates.append(dt.datetime.strptime(lpd, "%Y-%m-%d").date())
+            except Exception:
+                pass
+
+    if last_dates:
+        return max(last_dates) + dt.timedelta(days=1)
+
+    return dt.date(year, 1, 1)
+
+
+def get_year_end_for_update(year: int) -> dt.date:
+    return today_ist() if year == today_ist().year else dt.date(year, 12, 31)
+
+
 async def update_year(
     session: aiohttp.ClientSession,
     year: int,
@@ -736,7 +792,7 @@ async def update_year(
     state_year_dir = os.path.join(output_root, str(year))
 
     if year == today_ist().year and rebuild_current_year:
-        clear_year_dir(state_year_dir)
+        clear_dir_json(state_year_dir)
         clear_summary_file(output_root, year)
         state_dbs: Dict[str, Dict[str, Any]] = {}
         year_db = empty_year_db(year)
@@ -806,36 +862,6 @@ async def update_year(
     save_year_db(output_root, year, year_db)
 
     print(f"{year}: saved {saved} state files + 1 yearly summary")
-
-
-# ----------------------------
-# Main
-# ----------------------------
-def get_year_start_for_update(
-    year: int,
-    state_dbs: Dict[str, Dict[str, Any]],
-    rebuild_current_year: bool,
-) -> dt.date:
-    if year == today_ist().year and rebuild_current_year:
-        return dt.date(year, 1, 1)
-
-    last_dates = []
-    for db in state_dbs.values():
-        lpd = db.get("_m", {}).get("lpd")
-        if lpd:
-            try:
-                last_dates.append(dt.datetime.strptime(lpd, "%Y-%m-%d").date())
-            except Exception:
-                pass
-
-    if last_dates:
-        return max(last_dates) + dt.timedelta(days=1)
-
-    return dt.date(year, 1, 1)
-
-
-def get_year_end_for_update(year: int) -> dt.date:
-    return today_ist() if year == today_ist().year else dt.date(year, 12, 31)
 
 
 async def main() -> None:
