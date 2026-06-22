@@ -14,7 +14,7 @@ import pytz
 IST = pytz.timezone("Asia/Kolkata")
 
 # ----------------------------
-# Tunables
+# Tuning
 # ----------------------------
 DEFAULT_START_YEAR = 2023
 DEFAULT_TIMEOUT = 25
@@ -22,14 +22,21 @@ DEFAULT_CONCURRENCY = 100
 DEFAULT_RETRIES = 3
 DEFAULT_RETRY_BACKOFF = 0.75
 DEFAULT_MIN_MOVIE_DAY_GROSS = 100000
+REBUILD_CURRENT_YEAR_BY_DEFAULT = True
 
-PREFERRED_CHAINS = ["PVR", "INOX", "Cinepolis"]  # kept for future extensions
+# Kept for compatibility / future use
+PREFERRED_CHAINS = ["PVR", "INOX", "Cinepolis"]
+
 
 # ----------------------------
-# Helpers
+# Time / text helpers
 # ----------------------------
 def today_ist() -> dt.date:
     return dt.datetime.now(IST).date()
+
+
+def now_ist_str() -> str:
+    return dt.datetime.now(IST).strftime("%Y-%m-%d %H:%M IST")
 
 
 def safe_int(v: Any) -> int:
@@ -45,7 +52,7 @@ def normalize_spaces(text: str) -> str:
 
 
 def normalize_movie_name(name: str) -> str:
-    # Strip only a trailing bracketed suffix, e.g. "Zootopia 2 [3D | Hindi]" -> "Zootopia 2"
+    # "Zootopia 2 [3D | Hindi]" -> "Zootopia 2"
     return normalize_spaces(re.sub(r"\s*\[[^\]]*\]\s*$", "", name or ""))
 
 
@@ -62,6 +69,9 @@ def slugify_filename(text: str) -> str:
     return text or "unknown"
 
 
+# ----------------------------
+# File helpers
+# ----------------------------
 def atomic_write_json(path: str, payload: Dict[str, Any]) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
     tmp = path + ".tmp"
@@ -72,19 +82,26 @@ def atomic_write_json(path: str, payload: Dict[str, Any]) -> None:
     os.replace(tmp, path)
 
 
-def build_date_list(year: int) -> List[str]:
-    start = dt.date(year, 1, 1)
-    end = today_ist() if year == today_ist().year else dt.date(year, 12, 31)
-    dates = []
-    d = start
-    while d <= end:
-        dates.append(d.strftime("%Y-%m-%d"))
-        d += dt.timedelta(days=1)
-    return dates
+def clear_year_dir(year_dir: str) -> None:
+    if not os.path.isdir(year_dir):
+        return
+    for fn in os.listdir(year_dir):
+        if fn.endswith(".json") or fn.endswith(".json.tmp"):
+            try:
+                os.remove(os.path.join(year_dir, fn))
+            except OSError:
+                pass
 
 
-def get_urls(date_str):
-    # Preserved from your current logic.
+# ----------------------------
+# URL routing (kept same idea)
+# ----------------------------
+def is_more_than_one_month_old(date_str: str) -> bool:
+    d = dt.datetime.strptime(date_str, "%Y-%m-%d").date()
+    return (today_ist() - d).days > 31
+
+
+def get_urls(date_str: str):
     date_code = date_str.replace("-", "")
     year = int(date_str[:4])
     md = date_str[5:]
@@ -104,134 +121,147 @@ def get_urls(date_str):
     return url, fallback
 
 
-def is_more_than_one_month_old(date_str: str) -> bool:
-    d = dt.datetime.strptime(date_str, "%Y-%m-%d").date()
-    return (today_ist() - d).days > 31
-
-
+# ----------------------------
+# State DB structure
+# ----------------------------
 def empty_state_db(year: int, state_name: str, state_key: str) -> Dict[str, Any]:
     return {
-        "year": year,
-        "state": state_name,
-        "state_key": state_key,
-        "last_updated": "",
-        "_meta": {
-            "lastProcessedDate": None
+        "y": year,
+        "s": state_name,
+        "k": state_key,
+        "u": "",
+        "_m": {
+            "lpd": None
         },
         "movies": {}
     }
 
 
-def ensure_movie(state_db: Dict[str, Any], movie_name: str) -> Dict[str, Any]:
-    movies = state_db["movies"]
-    if movie_name not in movies:
-        movies[movie_name] = {
-            "variants": set(),
-            "daily": {},
-            "_cityAgg": {},
-            "totals": {},
-            "topCities": []
-        }
-    return movies[movie_name]
+def load_existing_state_dbs(output_root: str, year: int) -> Dict[str, Dict[str, Any]]:
+    year_dir = os.path.join(output_root, str(year))
+    if not os.path.isdir(year_dir):
+        return {}
+
+    out: Dict[str, Dict[str, Any]] = {}
+    for fn in os.listdir(year_dir):
+        if not fn.endswith(".json"):
+            continue
+        path = os.path.join(year_dir, fn)
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                db = json.load(f)
+            db.setdefault("_m", {"lpd": None})
+            db.setdefault("movies", {})
+            db.setdefault("u", "")
+            db.setdefault("s", db.get("s", ""))
+            db.setdefault("k", db.get("k", slugify_filename(db.get("s", fn[:-5]))))
+            out[db["k"]] = db
+        except Exception:
+            continue
+    return out
 
 
-def init_rollup() -> Dict[str, Any]:
+# ----------------------------
+# Aggregation helpers
+# ----------------------------
+def empty_rollup() -> Dict[str, Any]:
     return {
-        "gross": 0,
-        "sold": 0,
-        "shows": 0,
-        "totalSeats": 0,
-        "fastfilling": 0,
-        "housefull": 0,
-        "occWeight": 0.0,
-        "occSum": 0.0,
-        "rows": 0
+        "g": 0,
+        "s": 0,
+        "sh": 0,
+        "ts": 0,
+        "ff": 0,
+        "hf": 0,
+        "_occ_weight": 0.0,
+        "_occ_count": 0
     }
 
 
 def add_rollup(bucket: Dict[str, Any], row: Dict[str, Any]) -> None:
-    gross = safe_int(row.get("gross"))
-    sold = safe_int(row.get("sold"))
-    shows = safe_int(row.get("shows"))
-    total_seats = safe_int(row.get("totalSeats"))
-    fastfilling = safe_int(row.get("fastfilling"))
-    housefull = safe_int(row.get("housefull"))
-    occ = safe_float(row.get("occupancy"))
+    g = safe_int(row.get("gross"))
+    s = safe_int(row.get("sold"))
+    sh = safe_int(row.get("shows"))
+    ts = safe_int(row.get("totalSeats"))
+    ff = safe_int(row.get("fastfilling"))
+    hf = safe_int(row.get("housefull"))
+    o = safe_float(row.get("occupancy"))
 
-    bucket["gross"] += gross
-    bucket["sold"] += sold
-    bucket["shows"] += shows
-    bucket["totalSeats"] += total_seats
-    bucket["fastfilling"] += fastfilling
-    bucket["housefull"] += housefull
-    bucket["occSum"] += occ
-    bucket["occWeight"] += occ * total_seats if total_seats else occ
-    bucket["rows"] += 1
+    bucket["g"] += g
+    bucket["s"] += s
+    bucket["sh"] += sh
+    bucket["ts"] += ts
+    bucket["ff"] += ff
+    bucket["hf"] += hf
 
-
-def finalize_rollup(bucket: Dict[str, Any], state_name: Optional[str] = None, city: Optional[str] = None) -> Dict[str, Any]:
-    total_seats = int(bucket["totalSeats"])
-    if total_seats:
-        occupancy = round(bucket["occWeight"] / total_seats, 2)
-    elif bucket["rows"]:
-        occupancy = round(bucket["occSum"] / bucket["rows"], 2)
+    if ts > 0:
+        bucket["_occ_weight"] += o * ts
     else:
-        occupancy = 0.0
-
-    result = {
-        "gross": int(bucket["gross"]),
-        "sold": int(bucket["sold"]),
-        "shows": int(bucket["shows"]),
-        "totalSeats": int(bucket["totalSeats"]),
-        "fastfilling": int(bucket["fastfilling"]),
-        "housefull": int(bucket["housefull"]),
-        "occupancy": occupancy
-    }
-    if city is not None:
-        result["city"] = city
-    if state_name is not None:
-        result["state"] = state_name
-    return result
+        bucket["_occ_weight"] += o
+    bucket["_occ_count"] += 1
 
 
-def sort_details(detail_map: Dict[str, Dict[str, Any]], state_name: str) -> List[Dict[str, Any]]:
-    rows = []
-    for city, bucket in detail_map.items():
-        row = finalize_rollup(bucket, state_name=state_name, city=city)
-        rows.append(row)
-    rows.sort(key=lambda x: (x["gross"], x["sold"], x["shows"]), reverse=True)
-    return rows
+def finalize_rollup(bucket: Dict[str, Any]) -> Dict[str, Any]:
+    ts = int(bucket["ts"])
+    if ts > 0:
+        o = round(bucket["_occ_weight"] / ts, 2)
+    elif bucket["_occ_count"] > 0:
+        o = round(bucket["_occ_weight"] / bucket["_occ_count"], 2)
+    else:
+        o = 0.0
 
-
-def compute_totals_from_daily(movie: Dict[str, Any]) -> None:
-    gross = sold = shows = total_seats = fastfilling = housefull = 0
-    occ_weight = 0.0
-
-    for day in movie["daily"].values():
-        gross += safe_int(day.get("gross"))
-        sold += safe_int(day.get("sold"))
-        shows += safe_int(day.get("shows"))
-        total_seats += safe_int(day.get("totalSeats"))
-        fastfilling += safe_int(day.get("fastfilling"))
-        housefull += safe_int(day.get("housefull"))
-
-        day_occ = safe_float(day.get("occupancy"))
-        day_seats = safe_int(day.get("totalSeats"))
-        occ_weight += day_occ * day_seats if day_seats else day_occ
-
-    avg_occupancy = round(occ_weight / total_seats, 2) if total_seats else 0.0
-
-    movie["totals"] = {
-        "gross": int(gross),
-        "sold": int(sold),
-        "shows": int(shows),
-        "totalSeats": int(total_seats),
-        "fastfilling": int(fastfilling),
-        "housefull": int(housefull),
-        "occupancy": avg_occupancy
+    return {
+        "g": int(bucket["g"]),
+        "s": int(bucket["s"]),
+        "sh": int(bucket["sh"]),
+        "ts": int(bucket["ts"]),
+        "ff": int(bucket["ff"]),
+        "hf": int(bucket["hf"]),
+        "o": o
     }
 
 
+def build_date_list_for_year(year: int) -> List[str]:
+    start = dt.date(year, 1, 1)
+    end = today_ist() if year == today_ist().year else dt.date(year, 12, 31)
+    dates: List[str] = []
+    d = start
+    while d <= end:
+        dates.append(d.strftime("%Y-%m-%d"))
+        d += dt.timedelta(days=1)
+    return dates
+
+
+def get_year_start_for_update(
+    year: int,
+    state_dbs: Dict[str, Dict[str, Any]],
+    rebuild_current_year: bool
+) -> dt.date:
+    if year == today_ist().year and rebuild_current_year:
+        return dt.date(year, 1, 1)
+
+    # Old years: resume from max last processed date across existing state files.
+    last_dates = []
+    for db in state_dbs.values():
+        lpd = db.get("_m", {}).get("lpd")
+        if lpd:
+            try:
+                last_dates.append(dt.datetime.strptime(lpd, "%Y-%m-%d").date())
+            except Exception:
+                pass
+
+    if last_dates:
+        return max(last_dates) + dt.timedelta(days=1)
+
+    return dt.date(year, 1, 1)
+
+
+def get_year_end_for_update(year: int) -> dt.date:
+    return today_ist() if year == today_ist().year else dt.date(year, 12, 31)
+
+
+# ----------------------------
+# HTTP
+# ----------------------------
 def fetch_headers() -> Dict[str, str]:
     return {
         "Accept": "application/json,text/plain,*/*",
@@ -267,115 +297,26 @@ async def fetch_day(session: aiohttp.ClientSession, date_str: str) -> Tuple[str,
     return date_str, payload
 
 
-def add_day_to_state(
-    state_db: Dict[str, Any],
-    date_key: str,
-    source_title: str,
-    base_name: str,
-    state_name: str,
-    rows: List[Dict[str, Any]],
-    source_last_updated: str
-) -> None:
-    movie = ensure_movie(state_db, base_name)
-    movie["variants"].add(source_title)
-
-    daily = movie["daily"].setdefault(
-        date_key,
-        {
-            "gross": 0,
-            "sold": 0,
-            "shows": 0,
-            "totalSeats": 0,
-            "fastfilling": 0,
-            "housefull": 0,
-            "occupancy": 0.0,
-            "details": {}
+# ----------------------------
+# Core processing
+# ----------------------------
+def ensure_movie(state_db: Dict[str, Any], movie_name: str) -> Dict[str, Any]:
+    movies = state_db["movies"]
+    if movie_name not in movies:
+        movies[movie_name] = {
+            "d": {},
+            "_t": {
+                "g": 0,
+                "s": 0,
+                "sh": 0,
+                "ts": 0,
+                "ff": 0,
+                "hf": 0,
+                "_occ_weight": 0.0,
+                "_occ_count": 0
+            }
         }
-    )
-
-    if source_last_updated:
-        state_db["last_updated"] = source_last_updated
-
-    for row in rows:
-        gross = safe_int(row.get("gross"))
-        sold = safe_int(row.get("sold"))
-        shows = safe_int(row.get("shows"))
-        total_seats = safe_int(row.get("totalSeats"))
-        fastfilling = safe_int(row.get("fastfilling"))
-        housefull = safe_int(row.get("housefull"))
-        city = normalize_spaces(row.get("city") or "")
-
-        daily["gross"] += gross
-        daily["sold"] += sold
-        daily["shows"] += shows
-        daily["totalSeats"] += total_seats
-        daily["fastfilling"] += fastfilling
-        daily["housefull"] += housefull
-
-        if city:
-            city_bucket = daily["details"].setdefault(city, init_rollup())
-            add_rollup(city_bucket, row)
-
-            movie_city_bucket = movie["_cityAgg"].setdefault(city, init_rollup())
-            add_rollup(movie_city_bucket, row)
-
-    # Reliable state-day occupancy.
-    if daily["totalSeats"]:
-        daily["occupancy"] = round((daily["sold"] / daily["totalSeats"]) * 100, 2)
-    elif rows:
-        daily["occupancy"] = round(
-            sum(safe_float(r.get("occupancy")) for r in rows) / len(rows),
-            2
-        )
-    else:
-        daily["occupancy"] = 0.0
-
-
-def finalize_state_db(state_db: Dict[str, Any]) -> None:
-    final_movies: Dict[str, Any] = {}
-
-    for movie_name, movie in state_db["movies"].items():
-        compute_totals_from_daily(movie)
-
-        variants = sorted(movie["variants"])
-        movie["variants"] = variants
-
-        # Finalize daily city breakdowns
-        daily_final = {}
-        for date_key in sorted(movie["daily"].keys()):
-            day = movie["daily"][date_key]
-            details = sort_details(day.pop("details", {}), state_db["state"])
-            day["details"] = details
-            daily_final[date_key] = day
-        movie["daily"] = daily_final
-
-        # Movie-level top cities inside this state
-        top_cities = []
-        for city, bucket in movie["_cityAgg"].items():
-            row = finalize_rollup(bucket, state_name=state_db["state"], city=city)
-            top_cities.append([city, row["gross"], row["sold"], row["shows"], row["occupancy"]])
-        top_cities.sort(key=lambda x: (x[1], x[2], x[3]), reverse=True)
-        movie["topCities"] = top_cities[:10]
-
-        movie.pop("_cityAgg", None)
-        final_movies[movie_name] = movie
-
-    state_db["movies"] = dict(
-        sorted(
-            final_movies.items(),
-            key=lambda kv: kv[1]["totals"].get("gross", 0),
-            reverse=True
-        )
-    )
-
-
-def save_state_db(output_root: str, year: int, state_db: Dict[str, Any]) -> str:
-    year_dir = os.path.join(output_root, str(year))
-    os.makedirs(year_dir, exist_ok=True)
-
-    path = os.path.join(year_dir, f"{state_db['state_key']}.json")
-    atomic_write_json(path, state_db)
-    return path
+    return movies[movie_name]
 
 
 def build_base_gross_map(payload: Dict[str, Any]) -> Dict[str, int]:
@@ -384,6 +325,36 @@ def build_base_gross_map(payload: Dict[str, Any]) -> Dict[str, int]:
         base_name = normalize_movie_name(movie_name)
         base_gross[base_name] += safe_int(data.get("gross"))
     return base_gross
+
+
+def add_state_day(
+    state_db: Dict[str, Any],
+    movie_name: str,
+    date_key: str,
+    rows: List[Dict[str, Any]],
+    payload_last_updated: str
+) -> None:
+    movie = ensure_movie(state_db, movie_name)
+    day = movie["d"].setdefault(
+        date_key,
+        {
+            "g": 0,
+            "s": 0,
+            "sh": 0,
+            "ts": 0,
+            "ff": 0,
+            "hf": 0,
+            "_occ_weight": 0.0,
+            "_occ_count": 0
+        }
+    )
+
+    if payload_last_updated:
+        state_db["u"] = payload_last_updated
+
+    for row in rows:
+        add_rollup(day, row)
+        add_rollup(movie["_t"], row)
 
 
 def process_day_into_states(
@@ -397,42 +368,124 @@ def process_day_into_states(
         return
 
     date_key = date_str.replace("-", "")
-    source_last_updated = payload.get("last_updated", "")
+    payload_last_updated = payload.get("last_updated", "")
 
+    # Merge language/format variants by base movie name before filtering.
     base_gross = build_base_gross_map(payload)
 
-    for movie_name, data in payload["movies"].items():
-        base_name = normalize_movie_name(movie_name)
+    for movie_title, data in payload["movies"].items():
+        base_name = normalize_movie_name(movie_title)
 
-        # Keep your existing noise filter: only process meaningful movie-days.
         if base_gross[base_name] < min_movie_day_gross:
             continue
 
-        by_state: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+        # State-wise aggregation only. No city breakdown is stored.
+        state_rows: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
 
         for row in (data.get("details") or []):
             state_name = normalize_state_name(row.get("state") or "")
             if not state_name:
                 continue
-            by_state[state_name].append(row)
+            state_rows[state_name].append(row)
 
-        if not by_state:
+        if not state_rows:
             continue
 
-        for state_name, rows in by_state.items():
+        for state_name, rows in state_rows.items():
             state_key = slugify_filename(state_name)
             if state_key not in state_dbs:
                 state_dbs[state_key] = empty_state_db(year, state_name, state_key)
 
-            add_day_to_state(
+            add_state_day(
                 state_db=state_dbs[state_key],
+                movie_name=base_name,
                 date_key=date_key,
-                source_title=movie_name,
-                base_name=base_name,
-                state_name=state_name,
                 rows=rows,
-                source_last_updated=source_last_updated
+                payload_last_updated=payload_last_updated
             )
+
+
+def finalize_state_db(state_db: Dict[str, Any]) -> None:
+    final_movies: Dict[str, Any] = {}
+
+    for movie_name, movie in state_db["movies"].items():
+        daily = movie.get("d", {})
+        finalized_daily: Dict[str, Any] = {}
+
+        total = movie.get("_t", {
+            "g": 0,
+            "s": 0,
+            "sh": 0,
+            "ts": 0,
+            "ff": 0,
+            "hf": 0,
+            "_occ_weight": 0.0,
+            "_occ_count": 0
+        })
+
+        for date_key in sorted(daily.keys()):
+            day = daily[date_key]
+
+            ts = int(day["ts"])
+            if ts > 0:
+                o = round(day["_occ_weight"] / ts, 2)
+            elif day["_occ_count"] > 0:
+                o = round(day["_occ_weight"] / day["_occ_count"], 2)
+            else:
+                o = 0.0
+
+            finalized_daily[date_key] = {
+                "g": int(day["g"]),
+                "s": int(day["s"]),
+                "sh": int(day["sh"]),
+                "ts": int(day["ts"]),
+                "ff": int(day["ff"]),
+                "hf": int(day["hf"]),
+                "o": o
+            }
+
+        # Final totals
+        t_ts = int(total["ts"])
+        if t_ts > 0:
+            t_o = round(total["_occ_weight"] / t_ts, 2)
+        elif total["_occ_count"] > 0:
+            t_o = round(total["_occ_weight"] / total["_occ_count"], 2)
+        else:
+            t_o = 0.0
+
+        final_movies[movie_name] = {
+            "d": finalized_daily,
+            "t": {
+                "g": int(total["g"]),
+                "s": int(total["s"]),
+                "sh": int(total["sh"]),
+                "ts": int(total["ts"]),
+                "ff": int(total["ff"]),
+                "hf": int(total["hf"]),
+                "o": t_o
+            }
+        }
+
+    state_db["movies"] = dict(
+        sorted(
+            final_movies.items(),
+            key=lambda kv: kv[1]["t"]["g"],
+            reverse=True
+        )
+    )
+
+    # Cleanup root fields if needed
+    if not state_db.get("u"):
+        state_db["u"] = now_ist_str()
+
+
+def save_state_db(output_root: str, year: int, state_db: Dict[str, Any]) -> str:
+    year_dir = os.path.join(output_root, str(year))
+    os.makedirs(year_dir, exist_ok=True)
+
+    path = os.path.join(year_dir, f"{state_db['k']}.json")
+    atomic_write_json(path, state_db)
+    return path
 
 
 async def update_year(
@@ -440,16 +493,35 @@ async def update_year(
     year: int,
     output_root: str,
     min_movie_day_gross: int,
-    concurrency: int
+    concurrency: int,
+    rebuild_current_year: bool
 ) -> None:
-    dates = build_date_list(year)
-    if not dates:
+    year_dir = os.path.join(output_root, str(year))
+
+    # Rebuild current year from scratch to avoid stale files.
+    if year == today_ist().year and rebuild_current_year:
+        clear_year_dir(year_dir)
+        state_dbs: Dict[str, Dict[str, Any]] = {}
+        start = dt.date(year, 1, 1)
+    else:
+        state_dbs = load_existing_state_dbs(output_root, year)
+        start = get_year_start_for_update(year, state_dbs, rebuild_current_year=False)
+
+    end = get_year_end_for_update(year)
+
+    if start > end:
+        print(f"{year}: already up to date")
         return
+
+    dates: List[str] = []
+    d = start
+    while d <= end:
+        dates.append(d.strftime("%Y-%m-%d"))
+        d += dt.timedelta(days=1)
 
     print(f"{year}: fetching {len(dates)} days")
 
     sem = asyncio.Semaphore(concurrency)
-    state_dbs: Dict[str, Dict[str, Any]] = {}
 
     async def worker(ds: str):
         async with sem:
@@ -463,6 +535,7 @@ async def update_year(
     for result in results:
         if isinstance(result, Exception):
             continue
+
         date_str, payload = result
         if payload:
             process_day_into_states(
@@ -473,9 +546,18 @@ async def update_year(
                 min_movie_day_gross=min_movie_day_gross
             )
 
-    # Finalize + save all state files for this year
+    # Update last processed date marker
+    if dates:
+        last_date = dates[-1]
+        for db in state_dbs.values():
+            db.setdefault("_m", {})
+            db["_m"]["lpd"] = last_date
+
+    # Finalize + save each state file
     saved = 0
-    for state_key, state_db in state_dbs.items():
+    for _, state_db in state_dbs.items():
+        if not state_db.get("movies"):
+            continue
         finalize_state_db(state_db)
         save_state_db(output_root, year, state_db)
         saved += 1
@@ -483,6 +565,9 @@ async def update_year(
     print(f"{year}: saved {saved} state files")
 
 
+# ----------------------------
+# Main
+# ----------------------------
 async def main() -> None:
     parser = argparse.ArgumentParser(description="Build state-wise movie JSON files from daily summaries.")
     parser.add_argument("--start-year", type=int, default=DEFAULT_START_YEAR)
@@ -491,6 +576,18 @@ async def main() -> None:
     parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT)
     parser.add_argument("--concurrency", type=int, default=DEFAULT_CONCURRENCY)
     parser.add_argument("--min-movie-day-gross", type=int, default=DEFAULT_MIN_MOVIE_DAY_GROSS)
+    parser.add_argument(
+        "--rebuild-current-year",
+        action="store_true",
+        default=REBUILD_CURRENT_YEAR_BY_DEFAULT,
+        help="Rebuild the current year from Jan 1 every run."
+    )
+    parser.add_argument(
+        "--no-rebuild-current-year",
+        action="store_false",
+        dest="rebuild_current_year"
+    )
+
     args = parser.parse_args()
 
     timeout = aiohttp.ClientTimeout(total=args.timeout)
@@ -512,7 +609,8 @@ async def main() -> None:
                 year=year,
                 output_root=args.output_dir,
                 min_movie_day_gross=args.min_movie_day_gross,
-                concurrency=args.concurrency
+                concurrency=args.concurrency,
+                rebuild_current_year=args.rebuild_current_year
             )
 
     print("Done.")
