@@ -14,7 +14,7 @@ import pytz
 IST = pytz.timezone("Asia/Kolkata")
 
 # ----------------------------
-# Tuning
+# Tunables
 # ----------------------------
 DEFAULT_START_YEAR = 2023
 DEFAULT_TIMEOUT = 25
@@ -124,46 +124,6 @@ def get_urls(date_str: str):
 # ----------------------------
 # State DB structure
 # ----------------------------
-def empty_state_db(year: int, state_name: str, state_key: str) -> Dict[str, Any]:
-    return {
-        "y": year,
-        "s": state_name,
-        "k": state_key,
-        "u": "",
-        "_m": {
-            "lpd": None
-        },
-        "movies": {}
-    }
-
-
-def load_existing_state_dbs(output_root: str, year: int) -> Dict[str, Dict[str, Any]]:
-    year_dir = os.path.join(output_root, str(year))
-    if not os.path.isdir(year_dir):
-        return {}
-
-    out: Dict[str, Dict[str, Any]] = {}
-    for fn in os.listdir(year_dir):
-        if not fn.endswith(".json"):
-            continue
-        path = os.path.join(year_dir, fn)
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                db = json.load(f)
-            db.setdefault("_m", {"lpd": None})
-            db.setdefault("movies", {})
-            db.setdefault("u", "")
-            db.setdefault("s", db.get("s", ""))
-            db.setdefault("k", db.get("k", slugify_filename(db.get("s", fn[:-5]))))
-            out[db["k"]] = db
-        except Exception:
-            continue
-    return out
-
-
-# ----------------------------
-# Aggregation helpers
-# ----------------------------
 def empty_rollup() -> Dict[str, Any]:
     return {
         "g": 0,
@@ -173,18 +133,176 @@ def empty_rollup() -> Dict[str, Any]:
         "ff": 0,
         "hf": 0,
         "_occ_weight": 0.0,
-        "_occ_count": 0
+        "_occ_count": 0,
     }
 
 
+def empty_movie_bucket() -> Dict[str, Any]:
+    return {
+        "d": {},
+        "_t": empty_rollup(),
+    }
+
+
+def normalize_day_entry(day: Any) -> Dict[str, Any]:
+    if isinstance(day, list):
+        g = safe_int(day[0]) if len(day) > 0 else 0
+        s = safe_int(day[1]) if len(day) > 1 else 0
+        sh = safe_int(day[2]) if len(day) > 2 else 0
+        o = safe_float(day[3]) if len(day) > 3 else 0.0
+        return {
+            "g": g,
+            "s": s,
+            "sh": sh,
+            "ts": 0,
+            "ff": 0,
+            "hf": 0,
+            "_occ_weight": o,
+            "_occ_count": 1 if o else 0,
+        }
+
+    if not isinstance(day, dict):
+        return empty_rollup()
+
+    g = safe_int(day.get("g", day.get("gross")))
+    s = safe_int(day.get("s", day.get("sold")))
+    sh = safe_int(day.get("sh", day.get("shows")))
+    ts = safe_int(day.get("ts", day.get("totalSeats")))
+    ff = safe_int(day.get("ff", day.get("fastfilling")))
+    hf = safe_int(day.get("hf", day.get("housefull")))
+    o = safe_float(day.get("o", day.get("occupancy")))
+
+    return {
+        "g": g,
+        "s": s,
+        "sh": sh,
+        "ts": ts,
+        "ff": ff,
+        "hf": hf,
+        "_occ_weight": (o * ts) if ts else o,
+        "_occ_count": 1 if o else 0,
+    }
+
+
+def normalize_totals_entry(src: Any) -> Dict[str, Any]:
+    if not isinstance(src, dict):
+        return empty_rollup()
+
+    g = safe_int(src.get("g", src.get("gross")))
+    s = safe_int(src.get("s", src.get("sold")))
+    sh = safe_int(src.get("sh", src.get("shows")))
+    ts = safe_int(src.get("ts", src.get("totalSeats")))
+    ff = safe_int(src.get("ff", src.get("fastfilling")))
+    hf = safe_int(src.get("hf", src.get("housefull")))
+    o = safe_float(src.get("o", src.get("occupancy")))
+
+    return {
+        "g": g,
+        "s": s,
+        "sh": sh,
+        "ts": ts,
+        "ff": ff,
+        "hf": hf,
+        "_occ_weight": (o * ts) if ts else o,
+        "_occ_count": 1 if o else 0,
+    }
+
+
+def normalize_movie_entry(movie: Any) -> Dict[str, Any]:
+    if not isinstance(movie, dict):
+        return empty_movie_bucket()
+
+    # New format already
+    if "d" in movie and "_t" in movie:
+        movie["d"] = {
+            dk: normalize_day_entry(dv)
+            for dk, dv in (movie.get("d") or {}).items()
+        }
+        movie["_t"] = normalize_totals_entry(movie.get("_t"))
+        return movie
+
+    # Old format migration
+    dsrc = movie.get("daily") or movie.get("d") or {}
+    daily: Dict[str, Any] = {}
+
+    if isinstance(dsrc, dict):
+        for dk, dv in dsrc.items():
+            daily[dk] = normalize_day_entry(dv)
+
+    totals_src = movie.get("totals") or movie.get("_t") or {}
+    totals = normalize_totals_entry(totals_src)
+
+    # If daily exists, rebuild totals from it so old files stay compatible
+    if daily:
+        totals = empty_rollup()
+        for dv in daily.values():
+            add_rollup(totals, dv)
+
+    return {
+        "d": daily,
+        "_t": totals,
+    }
+
+
+def empty_state_db(year: int, state_name: str, state_key: str) -> Dict[str, Any]:
+    return {
+        "y": year,
+        "s": state_name,
+        "k": state_key,
+        "u": "",
+        "_m": {
+            "lpd": None,
+        },
+        "movies": {},
+    }
+
+
+def load_existing_state_dbs(output_root: str, year: int) -> Dict[str, Dict[str, Any]]:
+    year_dir = os.path.join(output_root, str(year))
+    if not os.path.isdir(year_dir):
+        return {}
+
+    out: Dict[str, Dict[str, Any]] = {}
+
+    for fn in os.listdir(year_dir):
+        if not fn.endswith(".json"):
+            continue
+
+        path = os.path.join(year_dir, fn)
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                db = json.load(f)
+
+            db.setdefault("_m", {"lpd": None})
+            db.setdefault("u", "")
+            db.setdefault("s", db.get("s", ""))
+            db.setdefault("k", db.get("k", slugify_filename(db.get("s", fn[:-5]))))
+            db.setdefault("movies", {})
+
+            normalized_movies = {}
+            for movie_name, movie in db["movies"].items():
+                normalized_movies[movie_name] = normalize_movie_entry(movie)
+
+            db["movies"] = normalized_movies
+            out[db["k"]] = db
+
+        except Exception:
+            continue
+
+    return out
+
+
+# ----------------------------
+# Aggregation helpers
+# ----------------------------
 def add_rollup(bucket: Dict[str, Any], row: Dict[str, Any]) -> None:
-    g = safe_int(row.get("gross"))
-    s = safe_int(row.get("sold"))
-    sh = safe_int(row.get("shows"))
-    ts = safe_int(row.get("totalSeats"))
-    ff = safe_int(row.get("fastfilling"))
-    hf = safe_int(row.get("housefull"))
-    o = safe_float(row.get("occupancy"))
+    g = safe_int(row.get("g"))
+    s = safe_int(row.get("s"))
+    sh = safe_int(row.get("sh"))
+    ts = safe_int(row.get("ts"))
+    ff = safe_int(row.get("ff"))
+    hf = safe_int(row.get("hf"))
+    o = safe_float(row.get("o"))
 
     bucket["g"] += g
     bucket["s"] += s
@@ -216,7 +334,7 @@ def finalize_rollup(bucket: Dict[str, Any]) -> Dict[str, Any]:
         "ts": int(bucket["ts"]),
         "ff": int(bucket["ff"]),
         "hf": int(bucket["hf"]),
-        "o": o
+        "o": o,
     }
 
 
@@ -234,7 +352,7 @@ def build_date_list_for_year(year: int) -> List[str]:
 def get_year_start_for_update(
     year: int,
     state_dbs: Dict[str, Dict[str, Any]],
-    rebuild_current_year: bool
+    rebuild_current_year: bool,
 ) -> dt.date:
     if year == today_ist().year and rebuild_current_year:
         return dt.date(year, 1, 1)
@@ -265,11 +383,15 @@ def get_year_end_for_update(year: int) -> dt.date:
 def fetch_headers() -> Dict[str, str]:
     return {
         "Accept": "application/json,text/plain,*/*",
-        "User-Agent": "Mozilla/5.0"
+        "User-Agent": "Mozilla/5.0",
     }
 
 
-async def fetch_json(session: aiohttp.ClientSession, url: str, retries: int = DEFAULT_RETRIES) -> Optional[Dict[str, Any]]:
+async def fetch_json(
+    session: aiohttp.ClientSession,
+    url: str,
+    retries: int = DEFAULT_RETRIES,
+) -> Optional[Dict[str, Any]]:
     for attempt in range(retries):
         try:
             async with session.get(url, headers=fetch_headers()) as resp:
@@ -302,20 +424,12 @@ async def fetch_day(session: aiohttp.ClientSession, date_str: str) -> Tuple[str,
 # ----------------------------
 def ensure_movie(state_db: Dict[str, Any], movie_name: str) -> Dict[str, Any]:
     movies = state_db["movies"]
+
     if movie_name not in movies:
-        movies[movie_name] = {
-            "d": {},
-            "_t": {
-                "g": 0,
-                "s": 0,
-                "sh": 0,
-                "ts": 0,
-                "ff": 0,
-                "hf": 0,
-                "_occ_weight": 0.0,
-                "_occ_count": 0
-            }
-        }
+        movies[movie_name] = empty_movie_bucket()
+    else:
+        movies[movie_name] = normalize_movie_entry(movies[movie_name])
+
     return movies[movie_name]
 
 
@@ -332,22 +446,10 @@ def add_state_day(
     movie_name: str,
     date_key: str,
     rows: List[Dict[str, Any]],
-    payload_last_updated: str
+    payload_last_updated: str,
 ) -> None:
     movie = ensure_movie(state_db, movie_name)
-    day = movie["d"].setdefault(
-        date_key,
-        {
-            "g": 0,
-            "s": 0,
-            "sh": 0,
-            "ts": 0,
-            "ff": 0,
-            "hf": 0,
-            "_occ_weight": 0.0,
-            "_occ_count": 0
-        }
-    )
+    day = movie["d"].setdefault(date_key, empty_rollup())
 
     if payload_last_updated:
         state_db["u"] = payload_last_updated
@@ -362,7 +464,7 @@ def process_day_into_states(
     date_str: str,
     payload: Dict[str, Any],
     state_dbs: Dict[str, Dict[str, Any]],
-    min_movie_day_gross: int
+    min_movie_day_gross: int,
 ) -> None:
     if not payload or "movies" not in payload:
         return
@@ -401,7 +503,7 @@ def process_day_into_states(
                 movie_name=base_name,
                 date_key=date_key,
                 rows=rows,
-                payload_last_updated=payload_last_updated
+                payload_last_updated=payload_last_updated,
             )
 
 
@@ -409,22 +511,15 @@ def finalize_state_db(state_db: Dict[str, Any]) -> None:
     final_movies: Dict[str, Any] = {}
 
     for movie_name, movie in state_db["movies"].items():
-        daily = movie.get("d", {})
+        movie = normalize_movie_entry(movie)
+
+        daily = movie.get("d") or {}
         finalized_daily: Dict[str, Any] = {}
 
-        total = movie.get("_t", {
-            "g": 0,
-            "s": 0,
-            "sh": 0,
-            "ts": 0,
-            "ff": 0,
-            "hf": 0,
-            "_occ_weight": 0.0,
-            "_occ_count": 0
-        })
+        total = normalize_totals_entry(movie.get("_t"))
 
         for date_key in sorted(daily.keys()):
-            day = daily[date_key]
+            day = normalize_day_entry(daily[date_key])
 
             ts = int(day["ts"])
             if ts > 0:
@@ -441,7 +536,7 @@ def finalize_state_db(state_db: Dict[str, Any]) -> None:
                 "ts": int(day["ts"]),
                 "ff": int(day["ff"]),
                 "hf": int(day["hf"]),
-                "o": o
+                "o": o,
             }
 
         # Final totals
@@ -462,19 +557,18 @@ def finalize_state_db(state_db: Dict[str, Any]) -> None:
                 "ts": int(total["ts"]),
                 "ff": int(total["ff"]),
                 "hf": int(total["hf"]),
-                "o": t_o
-            }
+                "o": t_o,
+            },
         }
 
     state_db["movies"] = dict(
         sorted(
             final_movies.items(),
             key=lambda kv: kv[1]["t"]["g"],
-            reverse=True
+            reverse=True,
         )
     )
 
-    # Cleanup root fields if needed
     if not state_db.get("u"):
         state_db["u"] = now_ist_str()
 
@@ -494,7 +588,7 @@ async def update_year(
     output_root: str,
     min_movie_day_gross: int,
     concurrency: int,
-    rebuild_current_year: bool
+    rebuild_current_year: bool,
 ) -> None:
     year_dir = os.path.join(output_root, str(year))
 
@@ -529,7 +623,7 @@ async def update_year(
 
     results = await asyncio.gather(
         *(worker(ds) for ds in dates),
-        return_exceptions=True
+        return_exceptions=True,
     )
 
     for result in results:
@@ -543,7 +637,7 @@ async def update_year(
                 date_str=date_str,
                 payload=payload,
                 state_dbs=state_dbs,
-                min_movie_day_gross=min_movie_day_gross
+                min_movie_day_gross=min_movie_day_gross,
             )
 
     # Update last processed date marker
@@ -580,12 +674,12 @@ async def main() -> None:
         "--rebuild-current-year",
         action="store_true",
         default=REBUILD_CURRENT_YEAR_BY_DEFAULT,
-        help="Rebuild the current year from Jan 1 every run."
+        help="Rebuild the current year from Jan 1 every run.",
     )
     parser.add_argument(
         "--no-rebuild-current-year",
         action="store_false",
-        dest="rebuild_current_year"
+        dest="rebuild_current_year",
     )
 
     args = parser.parse_args()
@@ -594,7 +688,7 @@ async def main() -> None:
     connector = aiohttp.TCPConnector(
         limit=args.concurrency,
         ttl_dns_cache=300,
-        enable_cleanup_closed=True
+        enable_cleanup_closed=True,
     )
 
     years = list(range(args.start_year, args.end_year + 1))
@@ -610,7 +704,7 @@ async def main() -> None:
                 output_root=args.output_dir,
                 min_movie_day_gross=args.min_movie_day_gross,
                 concurrency=args.concurrency,
-                rebuild_current_year=args.rebuild_current_year
+                rebuild_current_year=args.rebuild_current_year,
             )
 
     print("Done.")
