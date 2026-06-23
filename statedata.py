@@ -16,7 +16,7 @@ IST = pytz.timezone("Asia/Kolkata")
 # ----------------------------
 # Tunables
 # ----------------------------
-DEFAULT_START_YEAR = 2026
+DEFAULT_START_YEAR = 2025
 DEFAULT_TIMEOUT = 25
 DEFAULT_CONCURRENCY = 100
 DEFAULT_RETRIES = 3
